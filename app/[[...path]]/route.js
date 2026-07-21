@@ -25,72 +25,101 @@ function bridgeScript() {
 
     function cleanState(raw){
       if(!raw||typeof raw!=="object") return null;
-      var lat=Number(raw.lat), lng=Number(raw.lng), zoom=Number(raw.zoom);
+      var lat=Number(raw.lat),lng=Number(raw.lng),zoom=Number(raw.zoom);
       if(!Number.isFinite(lat)||!Number.isFinite(lng)||!Number.isFinite(zoom)) return null;
       return {lat:lat,lng:lng,zoom:zoom,path:location.pathname+location.search+location.hash};
     }
 
     function post(type,payload){
-      try{ parent.postMessage(Object.assign({channel:CHANNEL,type:type},payload||{}),"*"); }catch(_e){}
+      try{parent.postMessage(Object.assign({channel:CHANNEL,type:type},payload||{}),"*");}catch(_e){}
+    }
+
+    function looksLikeMap(value){
+      return !!value
+        && typeof value.getCenter==="function"
+        && typeof value.getZoom==="function"
+        && typeof value.setView==="function"
+        && typeof value.on==="function";
     }
 
     function currentState(){
-      if(!activeMap||typeof activeMap.getCenter!=="function"||typeof activeMap.getZoom!=="function") return null;
+      if(!looksLikeMap(activeMap)) return null;
       try{
         var center=activeMap.getCenter();
         return cleanState({lat:center.lat,lng:center.lng,zoom:activeMap.getZoom()});
-      }catch(_e){ return null; }
+      }catch(_e){return null;}
+    }
+
+    function sendCurrentState(reason,requestId){
+      var state=currentState();
+      if(state) post("state",{state:state,reason:reason||"change",requestId:requestId||null});
     }
 
     function emitState(reason){
       clearTimeout(emitTimer);
-      emitTimer=setTimeout(function(){
-        var state=currentState();
-        if(state) post("state",{state:state,reason:reason||"change"});
-      },60);
+      emitTimer=setTimeout(function(){sendCurrentState(reason||"change");},70);
     }
 
     function applyState(state){
       var clean=cleanState(state);
       if(!clean) return;
       pendingState=clean;
-      if(!activeMap||typeof activeMap.setView!=="function") return;
+      if(!looksLikeMap(activeMap)) return;
       try{
+        if(typeof activeMap.invalidateSize==="function") activeMap.invalidateSize({animate:false,pan:false});
         activeMap.setView([clean.lat,clean.lng],clean.zoom,{animate:false,reset:true});
-        setTimeout(function(){ emitState("applied"); },80);
+        setTimeout(function(){sendCurrentState("applied");},90);
       }catch(_e){}
     }
 
     function attachMap(map){
-      if(!map||map.__dmtAttached) return map;
+      if(!looksLikeMap(map)) return null;
+      if(map.__dmtAttached){activeMap=map;return map;}
       map.__dmtAttached=true;
       activeMap=map;
-      try{
-        map.on("moveend zoomend",function(){ emitState("moveend"); });
-      }catch(_e){}
-      if(pendingState) applyState(pendingState);
+      try{map.on("move zoom moveend zoomend",function(){emitState("moveend");});}catch(_e){}
       post("ready",{mapFound:true});
-      emitState("ready");
+      if(pendingState){
+        applyState(pendingState);
+        setTimeout(function(){if(pendingState) applyState(pendingState);},180);
+        setTimeout(function(){if(pendingState) applyState(pendingState);},650);
+      }
+      setTimeout(function(){sendCurrentState("ready");},120);
       return map;
+    }
+
+    function scanForMap(){
+      if(looksLikeMap(activeMap)) return activeMap;
+      var preferred=["map","myMap","mymap","atlasMap","leafletMap"];
+      for(var i=0;i<preferred.length;i++){
+        try{if(looksLikeMap(window[preferred[i]])) return attachMap(window[preferred[i]]);}catch(_e){}
+      }
+      var keys=[];
+      try{keys=Object.getOwnPropertyNames(window);}catch(_e){}
+      for(var j=0;j<keys.length;j++){
+        var value;
+        try{value=window[keys[j]];}catch(_e){continue;}
+        if(looksLikeMap(value)) return attachMap(value);
+      }
+      return null;
     }
 
     function patchLeaflet(L){
       if(!L||patchedLeaflet) return;
       patchedLeaflet=true;
       try{
-        if(L.Map&&typeof L.Map.addInitHook==="function"){
-          L.Map.addInitHook(function(){ attachMap(this); });
-        }
+        if(L.Map&&typeof L.Map.addInitHook==="function") L.Map.addInitHook(function(){attachMap(this);});
       }catch(_e){}
       try{
         if(typeof L.map==="function"&&!L.map.__dmtWrapped){
           var original=L.map;
-          var wrapped=function(){ return attachMap(original.apply(this,arguments)); };
+          var wrapped=function(){return attachMap(original.apply(this,arguments));};
           Object.assign(wrapped,original);
           wrapped.__dmtWrapped=true;
           L.map=wrapped;
         }
       }catch(_e){}
+      scanForMap();
     }
 
     try{
@@ -98,23 +127,27 @@ function bridgeScript() {
       Object.defineProperty(window,"L",{
         configurable:true,
         enumerable:true,
-        get:function(){ return storedL; },
-        set:function(value){ storedL=value; patchLeaflet(value); }
+        get:function(){return storedL;},
+        set:function(value){storedL=value;patchLeaflet(value);}
       });
       if(storedL) patchLeaflet(storedL);
     }catch(_e){}
 
     var poll=setInterval(function(){
-      try{ patchLeaflet(window.L); }catch(_e){}
+      try{patchLeaflet(window.L);scanForMap();}catch(_e){}
       if(activeMap) clearInterval(poll);
-    },50);
-    setTimeout(function(){ clearInterval(poll); },30000);
+    },75);
+    setTimeout(function(){clearInterval(poll);},30000);
 
     window.addEventListener("message",function(event){
       var data=event.data;
       if(!data||data.channel!==CHANNEL) return;
       if(data.type==="set-state") applyState(data.state);
-      if(data.type==="request-state") emitState("requested");
+      if(data.type==="request-state"){
+        scanForMap();
+        clearTimeout(emitTimer);
+        sendCurrentState("requested",data.requestId);
+      }
     });
 
     ["pushState","replaceState"].forEach(function(name){
@@ -122,17 +155,23 @@ function bridgeScript() {
         var original=history[name];
         history[name]=function(){
           var result=original.apply(this,arguments);
-          setTimeout(function(){ emitState("url"); },0);
+          setTimeout(function(){emitState("url");},0);
           return result;
         };
       }catch(_e){}
     });
-    window.addEventListener("hashchange",function(){ emitState("url"); });
-    window.addEventListener("popstate",function(){ emitState("url"); });
+    window.addEventListener("hashchange",function(){emitState("url");});
+    window.addEventListener("popstate",function(){emitState("url");});
+    window.addEventListener("load",function(){
+      scanForMap();
+      post("ready",{mapFound:!!activeMap});
+      if(pendingState) setTimeout(function(){applyState(pendingState);},100);
+    },{once:true});
 
     if(document.readyState==="loading"){
-      document.addEventListener("DOMContentLoaded",function(){ post("ready",{mapFound:!!activeMap}); },{once:true});
+      document.addEventListener("DOMContentLoaded",function(){scanForMap();post("ready",{mapFound:!!activeMap});},{once:true});
     }else{
+      scanForMap();
       post("ready",{mapFound:!!activeMap});
     }
   })();</script>`;
