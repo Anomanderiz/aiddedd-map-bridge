@@ -22,3 +22,10 @@ A direct `aidedd.org` iframe is cross-origin. Foundry may display it, but browse
 - This is intended for private campaign use. AideDD remains the source and owner of its content.
 - AideDD can change its HTML or mapping library, which may require the bridge script to be adjusted.
 - The bridge fetches only from the fixed `AIDEDD_ORIGIN`; it is not an open arbitrary proxy.
+
+
+## v1.0.1
+
+- Replies immediately when Foundry requests the final map centre and zoom during Close & Share.
+- More robustly discovers the Leaflet map even when the atlas creates it before the normal initialization hook catches it.
+- Reapplies an incoming saved viewport after the atlas finishes its own startup positioning.
